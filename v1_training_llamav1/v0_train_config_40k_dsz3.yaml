@@ -1,0 +1,47 @@
+# =============================================================================
+# V0 SFT 40K LoRA — DeepSpeed ZeRO-3 + CPU offload (无 CP，hyper_parallel不可用)
+# =============================================================================
+
+### model
+model_name_or_path: Qwen/Qwen3.5-2B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 64
+lora_alpha: 64
+lora_dropout: 0.0
+lora_target: all
+
+### dataset
+tokenized_path: ./tokenized_dataset_40k_new
+dataset: alpaca_en_demo
+template: qwen3_5
+cutoff_len: 40960
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: ./saves/qwen3.5-2b-v1-40k-dsz3
+logging_steps: 1
+save_strategy: epoch
+save_total_limit: 5
+overwrite_output_dir: true
+save_only_model: false
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+learning_rate: 1.0e-4
+num_train_epochs: 5.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+weight_decay: 0.01
+bf16: true
+ddp_timeout: 180000000
+gradient_checkpointing: true
+
+### deepspeed
+deepspeed: ds_z3_64k.json

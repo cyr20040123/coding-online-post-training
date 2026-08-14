@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3.5-2B LoRA SFT 训练报告</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f5f7fa;
+    --card-bg: #ffffff;
+    --text: #2c3e50;
+    --text-secondary: #64748b;
+    --border: #e2e8f0;
+    --accent: #3b82f6;
+    --success: #22c55e;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --purple: #8b5cf6;
+    --teal: #14b8a6;
+    --pink: #ec4899;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 24px;
+  }
+  .container { max-width: 1400px; margin: 0 auto; }
+  h1 {
+    font-size: 28px; font-weight: 700; margin-bottom: 4px;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--text-secondary); font-size: 14px; margin-bottom: 32px; }
+
+  /* Cards */
+  .card {
+    background: var(--card-bg);
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    padding: 24px;
+    margin-bottom: 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
+  }
+  .card h2 {
+    font-size: 18px; font-weight: 600;
+    margin-bottom: 16px; padding-bottom: 12px;
+    border-bottom: 2px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .card h2 .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+
+  /* Summary Stats Row */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .stat-box {
+    background: var(--card-bg);
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+    border: 1px solid var(--border);
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
+  }
+  .stat-box .value { font-size: 28px; font-weight: 700; }
+  .stat-box .label { font-size: 12px; color: var(--text-secondary); margin-top: 4px; text-transform: uppercase; letter-spacing: .5px; }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    background: #f8fafc; padding: 10px 12px; text-align: left;
+    font-weight: 600; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .5px; color: var(--text-secondary);
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  tbody tr:hover { background: #f8fafc; }
+  .mono { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; font-size: 12px; }
+
+  /* Badges */
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-ok { background: #dcfce7; color: #16a34a; }
+  .badge-warn { background: #fef9c3; color: #a16207; }
+  .badge-stopped { background: #fee2e2; color: #dc2626; }
+
+  /* Loss bar */
+  .loss-bar-wrap { display: flex; align-items: center; gap: 8px; }
+  .loss-bar { height: 6px; border-radius: 3px; background: #e2e8f0; flex: 1; overflow: hidden; }
+  .loss-bar-fill { height: 100%; border-radius: 3px; transition: width .3s; }
+
+  /* Chart containers */
+  .chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .chart-box { position: relative; height: 320px; }
+  .chart-box.wide { grid-column: span 2; }
+  @media (max-width: 900px) { .chart-row { grid-template-columns: 1fr; } .chart-box.wide { grid-column: span 1; } }
+
+  /* Compare table highlights */
+  .best { color: #16a34a; font-weight: 700; }
+  .worst { color: #dc2626; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tab {
+    padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border);
+    background: var(--card-bg); cursor: pointer; font-size: 13px;
+    transition: all .2s; color: var(--text-secondary);
+  }
+  .tab:hover { border-color: var(--accent); color: var(--accent); }
+  .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  footer { text-align: center; color: var(--text-secondary); font-size: 12px; margin-top: 32px; padding: 16px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Qwen3.5-2B LoRA SFT 训练报告</h1>
+<p class="subtitle">模型: Qwen/Qwen3.5-2B &nbsp;|&nbsp; 方法: LoRA (r=64, α=64) &nbsp;|&nbsp;
+   数据格式: ShareGPT (RFT筛选) &nbsp;|&nbsp; 生成时间: <span id="gen-time"></span></p>
+
+<!-- ====== Summary Stats ====== -->
+<div class="stats-grid">
+  <div class="stat-box">
+    <div class="value" style="color:var(--accent)">5</div>
+    <div class="label">训练实例</div>
+  </div>
+  <div class="stat-box">
+    <div class="value" style="color:var(--purple)">9,207</div>
+    <div class="label">总训练样本</div>
+  </div>
+  <div class="stat-box">
+    <div class="value" style="color:var(--teal)">1,495</div>
+    <div class="label">总优化步数</div>
+  </div>
+  <div class="stat-box">
+    <div class="value" style="color:var(--warning)">62.8h</div>
+    <div class="label">总训练时长</div>
+  </div>
+  <div class="stat-box">
+    <div class="value" style="color:var(--success)">0.00074</div>
+    <div class="label">最佳最终 Loss</div>
+  </div>
+  <div class="stat-box">
+    <div class="value" style="color:var(--pink)">67.3M</div>
+    <div class="label">可训练参数</div>
+  </div>
+</div>
+
+<!-- ====== Main Comparison Table ====== -->
+<div class="card">
+  <h2><span class="dot" style="background:var(--accent)"></span>训练实例总览</h2>
+  <div style="overflow-x:auto;">
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>实例名称</th>
+        <th>训练数据</th>
+        <th>样本数</th>
+        <th>Epochs</th>
+        <th>GPU</th>
+        <th>Eff BS</th>
+        <th>总步数</th>
+        <th>起始 Loss</th>
+        <th>最终 Loss</th>
+        <th>平均 Loss</th>
+        <th>Loss 降幅</th>
+        <th>耗时 (h)</th>
+        <th>状态</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>1</strong></td>
+        <td><strong>SWE-bench Resolved</strong></td>
+        <td>swebench_resolved</td>
+        <td>1,112</td>
+        <td>5</td>
+        <td>4× RTX3090</td>
+        <td>16</td>
+        <td>350</td>
+        <td class="mono">0.31538</td>
+        <td class="mono">0.00944</td>
+        <td class="mono">0.04546</td>
+        <td>97.0%</td>
+        <td>14.5</td>
+        <td><span class="badge badge-ok">完成</span></td>
+      </tr>
+      <tr style="background:#fff7ed">
+        <td><strong>2</strong></td>
+        <td><strong>MiniMax Resolved</strong></td>
+        <td>minimax_resolved</td>
+        <td>2,974</td>
+        <td>5→2</td>
+        <td>4× RTX3090</td>
+        <td>16</td>
+        <td>370</td>
+        <td class="mono">0.42040</td>
+        <td class="mono">0.02492</td>
+        <td class="mono" style="color:var(--text-secondary)">—</td>
+        <td>94.1%</td>
+        <td>—</td>
+        <td><span class="badge badge-stopped">Epoch2中断</span></td>
+      </tr>
+      <tr>
+        <td><strong>3</strong></td>
+        <td><strong>27B Distill ThinkAll</strong></td>
+        <td>27b_thinkall</td>
+        <td>1,112</td>
+        <td>3</td>
+        <td>4× RTX3090</td>
+        <td>16</td>
+        <td>210</td>
+        <td class="mono">0.36188</td>
+        <td class="mono best">0.00276</td>
+        <td class="mono best">0.00527</td>
+        <td>99.2%</td>
+        <td>6.4</td>
+        <td><span class="badge badge-ok">完成</span></td>
+      </tr>
+      <tr>
+        <td><strong>4</strong></td>
+        <td><strong>M3 ThinkAll</strong></td>
+        <td>minimax_thinkall</td>
+        <td>2,974</td>
+        <td>4</td>
+        <td>8× RTX3090</td>
+        <td>32</td>
+        <td>370</td>
+        <td class="mono">0.61017</td>
+        <td class="mono best">0.00074</td>
+        <td class="mono">0.09583</td>
+        <td>99.9%</td>
+        <td>29.1</td>
+        <td><span class="badge badge-ok">完成</span></td>
+      </tr>
+      <tr>
+        <td><strong>5</strong></td>
+        <td><strong>GLM-5.2 Resolved</strong></td>
+        <td>glm52_resolved</td>
+        <td>1,035</td>
+        <td>3</td>
+        <td>4× RTX3090</td>
+        <td>16</td>
+        <td>195</td>
+        <td class="mono">0.64778</td>
+        <td class="mono">0.00557</td>
+        <td class="mono">0.13604</td>
+        <td>99.1%</td>
+        <td>8.1</td>
+        <td><span class="badge badge-ok">完成</span></td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<!-- ====== Training Config Detail ====== -->
+<div class="card">
+  <h2><span class="dot" style="background:var(--purple)"></span>统一训练配置</h2>
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px;">
+    <div>
+      <table>
+        <thead><tr><th colspan="2">模型 & 微调方法</th></tr></thead>
+        <tbody>
+          <tr><td>基座模型</td><td><strong>Qwen/Qwen3.5-2B</strong> (2.28B params)</td></tr>
+          <tr><td>微调方法</td><td><strong>LoRA</strong> (rank=64, alpha=64, dropout=0)</td></tr>
+          <tr><td>LoRA 目标模块</td><td>all (q_proj, v_proj, k_proj, o_proj, gate_proj, up_proj, down_proj)</td></tr>
+          <tr><td>可训练参数</td><td><strong>67,301,376</strong> (2.95% of total)</td></tr>
+          <tr><td>数据类型</td><td>bf16 (模型权重) + fp32 (LoRA/优化器)</td></tr>
+          <tr><td>序列长度</td><td><strong>32,768 tokens</strong> (cutoff_len)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <table>
+        <thead><tr><th colspan="2">优化器 & 调度</th></tr></thead>
+        <tbody>
+          <tr><td>优化器</td><td><strong>AdamW</strong> (β₁=0.9, β₂=0.999, ε=1e-8)</td></tr>
+          <tr><td>学习率</td><td><strong>1.0×10⁻⁴</strong> (peak)</td></tr>
+          <tr><td>调度器</td><td><strong>Cosine</strong> (warmup_ratio=0.1)</td></tr>
+          <tr><td>Weight Decay</td><td><strong>0.01</strong></td></tr>
+          <tr><td>Batch Size / GPU</td><td><strong>1</strong> (per_device_train_batch_size)</td></tr>
+          <tr><td>梯度累积步数</td><td><strong>4</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <table>
+        <thead><tr><th colspan="2">内存优化 & 分布式</th></tr></thead>
+        <tbody>
+          <tr><td>Attention 实现</td><td><strong>flash-attn 2.8.3</strong> (head_dim=256)</td></tr>
+          <tr><td>Loss 融合</td><td><strong>liger_kernel 0.8.0</strong> (fused CE)</td></tr>
+          <tr><td>梯度检查点</td><td><strong>启用</strong> (gradient_checkpointing)</td></tr>
+          <tr><td>分布式框架</td><td><strong>DDP</strong> (torchrun, FORCE_TORCHRUN=1)</td></tr>
+          <tr><td>单卡显存占用</td><td><strong>≈22 GB</strong> / 24 GB (RTX 3090)</td></tr>
+          <tr><td>Loss 计算策略</td><td><strong>仅 assistant 回复</strong> (train_on_prompt: false)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ====== Loss Curves ====== -->
+<div class="card">
+  <h2><span class="dot" style="background:var(--warning)"></span>Loss 曲线对比</h2>
+
+  <div class="tabs" id="chart-tabs">
+    <button class="tab active" onclick="switchChart('all')">全部实例</button>
+    <button class="tab" onclick="switchChart('best')">Top 3 (最低Loss)</button>
+    <button class="tab" onclick="switchChart('log')">对数坐标</button>
+    <button class="tab" onclick="switchChart('perepoch')">按 Epoch 对齐</button>
+  </div>
+
+  <div class="chart-row">
+    <div class="chart-box wide" id="chart-all">
+      <canvas id="lossAll"></canvas>
+    </div>
+    <div class="chart-box wide" id="chart-best" style="display:none;">
+      <canvas id="lossBest"></canvas>
+    </div>
+    <div class="chart-box wide" id="chart-log" style="display:none;">
+      <canvas id="lossLog"></canvas>
+    </div>
+    <div class="chart-box wide" id="chart-perepoch" style="display:none;">
+      <canvas id="lossPerEpoch"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- ====== Loss Stats Table ====== -->
+<div class="card">
+  <h2><span class="dot" style="background:var(--teal)"></span>Loss 统计详情</h2>
+  <div style="overflow-x:auto;">
+  <table>
+    <thead>
+      <tr>
+        <th>实例</th>
+        <th>起始 Loss</th>
+        <th>Epoch 1 末</th>
+        <th>Epoch 2 末</th>
+        <th>Epoch 3 末</th>
+        <th>Epoch 4 末</th>
+        <th>Epoch 5 末</th>
+        <th>最终 Loss</th>
+        <th>最低 Loss</th>
+        <th>Loss 方差</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>1. SWE-bench</strong></td>
+        <td class="mono">0.31538</td>
+        <td class="mono">0.05694</td>
+        <td class="mono">0.02782</td>
+        <td class="mono">0.01622</td>
+        <td class="mono">0.01003</td>
+        <td class="mono best">0.00944</td>
+        <td class="mono">0.00944</td>
+        <td class="mono">0.00675 (step 310)</td>
+        <td class="mono">0.0061</td>
+      </tr>
+      <tr style="background:#fff7ed">
+        <td><strong>2. MiniMax</strong></td>
+        <td class="mono">0.42040</td>
+        <td class="mono">0.21334</td>
+        <td class="mono">0.02492</td>
+        <td style="color:var(--text-secondary)">—</td>
+        <td style="color:var(--text-secondary)">—</td>
+        <td style="color:var(--text-secondary)">—</td>
+        <td class="mono">0.02492</td>
+        <td class="mono">0.01741 (step 360)</td>
+        <td class="mono">0.0129</td>
+      </tr>
+      <tr>
+        <td><strong>3. 27B ThinkAll</strong></td>
+        <td class="mono">0.36188</td>
+        <td class="mono">0.04067</td>
+        <td class="mono">0.00382</td>
+        <td class="mono best">0.00276</td>
+        <td style="color:var(--text-secondary)">—</td>
+        <td style="color:var(--text-secondary)">—</td>
+        <td class="mono">0.00276</td>
+        <td class="mono">0.00252 (step 180)</td>
+        <td class="mono">0.0084</td>
+      </tr>
+      <tr>
+        <td><strong>4. M3 ThinkAll</strong></td>
+        <td class="mono">0.61017</td>
+        <td class="mono">0.24660</td>
+        <td class="mono">0.07545</td>
+        <td class="mono">0.00419</td>
+        <td class="mono best">0.00074</td>
+        <td style="color:var(--text-secondary)">—</td>
+        <td class="mono">0.00074</td>
+        <td class="mono">0.00074 (step 370)</td>
+        <td class="mono">0.0233</td>
+      </tr>
+      <tr>
+        <td><strong>5. GLM-5.2</strong></td>
+        <td class="mono">0.64778</td>
+        <td class="mono">0.09557</td>
+        <td class="mono">0.01686</td>
+        <td class="mono">0.00557</td>
+        <td style="color:var(--text-secondary)">—</td>
+        <td style="color:var(--text-secondary)">—</td>
+        <td class="mono">0.00557</td>
+        <td class="mono">0.00557 (step 190)</td>
+        <td class="mono">0.0229</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<!-- ====== Per-Instance Detail Cards ====== -->
+<div class="card">
+  <h2><span class="dot" style="background:var(--pink)"></span>实例详情</h2>
+
+  <!-- Instance 1 -->
+  <details style="margin-bottom:12px;">
+    <summary style="cursor:pointer;font-weight:600;padding:12px;background:#f8fafc;border-radius:8px;border:1px solid var(--border);">
+      实例 1: SWE-bench Resolved &nbsp;|&nbsp; 1,112 样本 &nbsp;|&nbsp; 5 epochs &nbsp;|&nbsp; Loss 0.315 → 0.009 &nbsp;|&nbsp; 14.5h
+    </summary>
+    <div style="padding:16px;">
+      <table>
+        <thead><tr><th>指标</th><th>值</th><th>指标</th><th>值</th></tr></thead>
+        <tbody>
+          <tr><td>训练数据</td><td>swebench_resolved_sharegpt.jsonl</td><td>Epochs</td><td>5</td></tr>
+          <tr><td>样本数</td><td>1,112 (RFT筛选)</td><td>数据来源</td><td>SWE-bench Verified + mini-swe-agent</td></tr>
+          <tr><td>GPUs</td><td>4× RTX 3090 (DDP)</td><td>有效 Batch Size</td><td>16</td></tr>
+          <tr><td>每 Epoch 步数</td><td>70</td><td>总步数</td><td>350</td></tr>
+          <tr><td>Checkpoints</td><td colspan="3">step 70, 140, 210, 280, 350 (每 epoch)</td></tr>
+          <tr><td>输出目录</td><td colspan="3"><code>saves/qwen3.5-2b/lora/sft/</code></td></tr>
+          <tr><td>配置文件</td><td colspan="3"><code>train_qwen3.5_2b_sft.yaml</code> (基准模板)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+
+  <!-- Instance 2 -->
+  <details style="margin-bottom:12px;">
+    <summary style="cursor:pointer;font-weight:600;padding:12px;background:#fff7ed;border-radius:8px;border:1px solid var(--border);">
+      实例 2: MiniMax Resolved &nbsp;|&nbsp; 2,974 样本 &nbsp;|&nbsp; 2 epochs (中断) &nbsp;|&nbsp; Loss 0.420 → 0.025
+    </summary>
+    <div style="padding:16px;">
+      <table>
+        <thead><tr><th>指标</th><th>值</th><th>指标</th><th>值</th></tr></thead>
+        <tbody>
+          <tr><td>训练数据</td><td>minimax_resolved_sharegpt.jsonl</td><td>Epochs</td><td>5→2 (提前停止)</td></tr>
+          <tr><td>样本数</td><td>2,974 (RFT筛选)</td><td>数据来源</td><td>MiniMax Mermaid MSA trajectories</td></tr>
+          <tr><td>GPUs</td><td>4× RTX 3090 (DDP)</td><td>有效 Batch Size</td><td>16</td></tr>
+          <tr><td>每 Epoch 步数</td><td>186</td><td>总步数</td><td>370 (完成2 epochs)</td></tr>
+          <tr><td>Checkpoints</td><td colspan="3">step 186, 372</td></tr>
+          <tr><td>状态</td><td colspan="3"><span class="badge badge-stopped">Epoch 2 末手动停止</span> — 已作为 2-epoch 训练保留</td></tr>
+          <tr><td>输出目录</td><td colspan="3"><code>saves/qwen3.5-2b-minimax/lora/sft/</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+
+  <!-- Instance 3 -->
+  <details style="margin-bottom:12px;">
+    <summary style="cursor:pointer;font-weight:600;padding:12px;background:#f8fafc;border-radius:8px;border:1px solid var(--border);">
+      实例 3: 27B Distill ThinkAll &nbsp;|&nbsp; 1,112 样本 &nbsp;|&nbsp; 3 epochs &nbsp;|&nbsp; Loss 0.362 → 0.003 &nbsp;|&nbsp; 6.4h
+    </summary>
+    <div style="padding:16px;">
+      <table>
+        <thead><tr><th>指标</th><th>值</th><th>指标</th><th>值</th></tr></thead>
+        <tbody>
+          <tr><td>训练数据</td><td>27b_thinkall_sharegpt.jsonl</td><td>Epochs</td><td>3</td></tr>
+          <tr><td>样本数</td><td>1,112 (RFT筛选)</td><td>数据来源</td><td>Qwen3.5-27B distilled reasoning traces</td></tr>
+          <tr><td>GPUs</td><td>4× RTX 3090 (DDP)</td><td>有效 Batch Size</td><td>16</td></tr>
+          <tr><td>每 Epoch 步数</td><td>70</td><td>总步数</td><td>210</td></tr>
+          <tr><td>特殊操作</td><td colspan="3">从 checkpoint-70 (epoch 1) 恢复训练，overwrite_output_dir: false</td></tr>
+          <tr><td>Checkpoints</td><td colspan="3">step 70, 140, 210</td></tr>
+          <tr><td>输出目录</td><td colspan="3"><code>saves/qwen3.5-2b-27b-thinkall/lora/sft/</code></td></tr>
+          <tr><td>备注</td><td colspan="3"><strong>最低平均 loss (0.00527)</strong> — 27B 蒸馏推理轨迹质量最高</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+
+  <!-- Instance 4 -->
+  <details style="margin-bottom:12px;">
+    <summary style="cursor:pointer;font-weight:600;padding:12px;background:#f8fafc;border-radius:8px;border:1px solid var(--border);">
+      实例 4: M3 ThinkAll &nbsp;|&nbsp; 2,974 样本 &nbsp;|&nbsp; 4 epochs &nbsp;|&nbsp; Loss 0.610 → 0.001 &nbsp;|&nbsp; 29.1h
+    </summary>
+    <div style="padding:16px;">
+      <table>
+        <thead><tr><th>指标</th><th>值</th><th>指标</th><th>值</th></tr></thead>
+        <tbody>
+          <tr><td>训练数据</td><td>minimax_thinkall_sharegpt.jsonl</td><td>Epochs</td><td>4</td></tr>
+          <tr><td>样本数</td><td>2,974 (RFT筛选)</td><td>数据来源</td><td>MiniMax Mermaid + ThinkAll reasoning</td></tr>
+          <tr><td>GPUs</td><td>8× RTX 3090 (DDP)</td><td>有效 Batch Size</td><td>32</td></tr>
+          <tr><td>每 Epoch 步数</td><td>93</td><td>总步数</td><td>370</td></tr>
+          <tr><td>初始尝试</td><td colspan="3">64K OOM → 48K OOM → 降为 32K 成功</td></tr>
+          <tr><td>Checkpoints</td><td colspan="3">step 93, 186, 279, 372</td></tr>
+          <tr><td>输出目录</td><td colspan="3"><code>saves/qwen3.5-2b-m3-thinkall-64k/lora/sft/</code></td></tr>
+          <tr><td>备注</td><td colspan="3"><strong>最低最终 loss (0.00074)</strong> — 4 epochs + 大量数据 + ThinkAll 推理</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+
+  <!-- Instance 5 -->
+  <details style="margin-bottom:12px;">
+    <summary style="cursor:pointer;font-weight:600;padding:12px;background:#f8fafc;border-radius:8px;border:1px solid var(--border);">
+      实例 5: GLM-5.2 Resolved &nbsp;|&nbsp; 1,035 样本 &nbsp;|&nbsp; 3 epochs &nbsp;|&nbsp; Loss 0.648 → 0.006 &nbsp;|&nbsp; 8.1h
+    </summary>
+    <div style="padding:16px;">
+      <table>
+        <thead><tr><th>指标</th><th>值</th><th>指标</th><th>值</th></tr></thead>
+        <tbody>
+          <tr><td>训练数据</td><td>glm52_resolved_sharegpt.jsonl</td><td>Epochs</td><td>3</td></tr>
+          <tr><td>样本数</td><td>1,035 (RFT筛选)</td><td>数据来源</td><td>GLM-5.2 SWE-bench trajectories</td></tr>
+          <tr><td>GPUs</td><td>4× RTX 3090 (DDP) ← 8 GPU 重训</td><td>有效 Batch Size</td><td>16</td></tr>
+          <tr><td>每 Epoch 步数</td><td>65</td><td>总步数</td><td>195</td></tr>
+          <tr><td>重训原因</td><td colspan="3">8 GPU eff_bs=32 → 仅 90 步/3 epochs，梯度更新太少</td></tr>
+          <tr><td>Checkpoints</td><td colspan="3">step 65, 130, 195 (旧版 8GPU: 33, 66, 99 已备份)</td></tr>
+          <tr><td>输出目录</td><td colspan="3"><code>saves/qwen3.5-2b-glm52/lora/sft/</code></td></tr>
+          <tr><td>对比旧版</td><td colspan="3">avg_loss: 0.2129 → <strong>0.1360</strong> | final_loss: 0.0436 → <strong>0.0056</strong> | 步数: 90 → <strong>195</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+</div>
+
+<!-- ====== Training Timeline ====== -->
+<div class="card">
+  <h2><span class="dot" style="background:var(--accent)"></span>训练时间线</h2>
+  <div style="overflow-x:auto;">
+  <table>
+    <thead>
+      <tr><th>顺序</th><th>实例</th><th>配置</th><th>日期</th><th>耗时</th><th>结果</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td><td>SWE-bench Resolved</td>
+        <td>4GPU, 5ep, eff_bs=16</td>
+        <td>2026-07-16</td><td>14.5h</td>
+        <td>✅ 完成，loss=0.009</td>
+      </tr>
+      <tr>
+        <td>2</td><td>MiniMax Resolved</td>
+        <td>4GPU, 5→2ep, eff_bs=16</td>
+        <td>2026-07-16</td><td>—</td>
+        <td>⚠️ Epoch 2 中断</td>
+      </tr>
+      <tr>
+        <td>3</td><td>27B Distill ThinkAll</td>
+        <td>4GPU, 3ep, eff_bs=16</td>
+        <td>2026-07-17</td><td>6.4h</td>
+        <td>✅ 完成，loss=0.003</td>
+      </tr>
+      <tr>
+        <td>4</td><td>M3 ThinkAll</td>
+        <td>8GPU, 4ep, eff_bs=32</td>
+        <td>2026-07-17~18</td><td>29.1h</td>
+        <td>✅ 完成，loss=0.001</td>
+      </tr>
+      <tr>
+        <td>5a</td><td>GLM-5.2 (初次)</td>
+        <td>8GPU, 3ep, eff_bs=32</td>
+        <td>2026-07-22</td><td>4.7h</td>
+        <td>⚠️ 步数不足 (90)，loss=0.044</td>
+      </tr>
+      <tr>
+        <td>5b</td><td>GLM-5.2 (重训)</td>
+        <td>4GPU, 3ep, eff_bs=16</td>
+        <td>2026-07-23</td><td>8.1h</td>
+        <td>✅ 完成，loss=0.006</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<!-- ====== Key Findings ====== -->
+<div class="card">
+  <h2><span class="dot" style="background:var(--success)"></span>关键发现 & 经验总结</h2>
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(380px, 1fr)); gap:16px;">
+
+    <div style="border:1px solid var(--border);border-radius:8px;padding:16px;">
+      <h3 style="font-size:15px;margin-bottom:8px;">🎯 数据质量 > 数据数量</h3>
+      <ul style="font-size:13px;color:var(--text-secondary);padding-left:20px;">
+        <li>27B ThinkAll (1,112样本) 平均 loss <strong>0.00527</strong> — 最低</li>
+        <li>M3 ThinkAll (2,974样本) 最终 loss <strong>0.00074</strong> — 但平均 loss 更高 (0.09583)</li>
+        <li>ThinkAll 推理轨迹明显优于纯 resolved 数据</li>
+      </ul>
+    </div>
+
+    <div style="border:1px solid var(--border);border-radius:8px;padding:16px;">
+      <h3 style="font-size:15px;margin-bottom:8px;">📈 梯度更新频率至关重要</h3>
+      <ul style="font-size:13px;color:var(--text-secondary);padding-left:20px;">
+        <li>GLM-5.2 8GPU: 90步 → loss 0.044 ; 4GPU: 195步 → loss <strong>0.006</strong></li>
+        <li>eff_bs=16 配合 ~200+ 步/3epoch 是最低配置要求</li>
+        <li>样本太少 + eff_bs 太大 = 梯度更新不够</li>
+      </ul>
+    </div>
+
+    <div style="border:1px solid var(--border);border-radius:8px;padding:16px;">
+      <h3 style="font-size:15px;margin-bottom:8px;">💾 显存瓶颈在 seq_len</h3>
+      <ul style="font-size:13px;color:var(--text-secondary);padding-left:20px;">
+        <li>32K: ~22GB / 24GB ✅ &nbsp;|&nbsp; 48K: ~23.2GB ⚠️ &nbsp;|&nbsp; 64K: >30GB ❌</li>
+        <li>模型权重仅占 19%，seq_len 相关项占 60%+</li>
+        <li>flash-attn (head_dim=256) + liger_kernel (fused CE) 是必须的</li>
+      </ul>
+    </div>
+
+    <div style="border:1px solid var(--border);border-radius:8px;padding:16px;">
+      <h3 style="font-size:15px;margin-bottom:8px;">🔄 数据格式统一为 ShareGPT</h3>
+      <ul style="font-size:13px;color:var(--text-secondary);padding-left:20px;">
+        <li>所有数据使用 ShareGPT 格式，仅对 assistant (gpt) 回复计算 loss</li>
+        <li>RFT 筛选：只用 resolved (成功) 轨迹</li>
+        <li>ThinkAll 变体包含 <code>&lt;think&gt;</code> 推理块</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<footer>
+  Generated from sft_training_loss.csv & trainer_state.json &nbsp;|&nbsp;
+  Model: Qwen/Qwen3.5-2B &nbsp;|&nbsp;
+  Method: LoRA (r=64) @ 32K context &nbsp;|&nbsp;
+  <span id="footer-date"></span>
+</footer>
+
+</div><!-- .container -->
+
+<!-- ====== Chart.js Scripts ====== -->
+<script>
+// ===== DATA =====
+const datasets = [
+  {
+    label: '1. SWE-bench (5ep)',
+    data: [
+      {x:0.144, y:0.31538},{x:0.288, y:0.22752},{x:0.432, y:0.19157},{x:0.576, y:0.13806},
+      {x:0.719, y:0.11061},{x:0.863, y:0.08977},{x:1.0,   y:0.05694},{x:1.144, y:0.04642},
+      {x:1.288, y:0.03586},{x:1.432, y:0.02951},{x:1.576, y:0.02816},{x:1.719, y:0.02724},
+      {x:1.863, y:0.02504},{x:2.0,   y:0.02782},{x:2.144, y:0.01630},{x:2.288, y:0.01867},
+      {x:2.432, y:0.01536},{x:2.576, y:0.01335},{x:2.719, y:0.01573},{x:2.863, y:0.01577},
+      {x:3.0,   y:0.01622},{x:3.144, y:0.01056},{x:3.288, y:0.01128},{x:3.432, y:0.01058},
+      {x:3.576, y:0.01009},{x:3.719, y:0.01055},{x:3.863, y:0.01052},{x:4.0,   y:0.01003},
+      {x:4.144, y:0.00850},{x:4.288, y:0.00749},{x:4.432, y:0.00675},{x:4.576, y:0.00761},
+      {x:4.719, y:0.00827},{x:4.863, y:0.00811},{x:5.0,   y:0.00944}
+    ],
+    color: '#3b82f6', bg: 'rgba(59,130,246,0.08)', dash: []
+  },
+  {
+    label: '2. MiniMax (2ep, 中断)',
+    data: [
+      {x:0.054, y:0.42040},{x:0.108, y:0.35895},{x:0.161, y:0.34193},{x:0.215, y:0.28411},
+      {x:0.269, y:0.26797},{x:0.323, y:0.23324},{x:0.376, y:0.21334},{x:0.430, y:0.17671},
+      {x:0.484, y:0.13619},{x:0.538, y:0.11473},{x:0.591, y:0.08640},{x:0.645, y:0.07748},
+      {x:0.699, y:0.05631},{x:0.753, y:0.04257},{x:0.806, y:0.04349},{x:0.860, y:0.04302},
+      {x:0.914, y:0.03526},{x:0.968, y:0.04786},{x:1.022, y:0.02866},{x:1.075, y:0.03755},
+      {x:1.129, y:0.02727},{x:1.183, y:0.02701},{x:1.237, y:0.03127},{x:1.290, y:0.01843},
+      {x:1.344, y:0.03801},{x:1.398, y:0.02530},{x:1.452, y:0.02385},{x:1.505, y:0.02863},
+      {x:1.559, y:0.02879},{x:1.613, y:0.02604},{x:1.667, y:0.02070},{x:1.720, y:0.03290},
+      {x:1.774, y:0.02446},{x:1.828, y:0.02658},{x:1.882, y:0.02550},{x:1.935, y:0.01741},
+      {x:1.989, y:0.02492}
+    ],
+    color: '#f59e0b', bg: 'rgba(245,158,11,0.06)', dash: [6,4]
+  },
+  {
+    label: '3. 27B ThinkAll (3ep)',
+    data: [
+      {x:0.144, y:0.36188},{x:0.288, y:0.26507},{x:0.432, y:0.21096},{x:0.576, y:0.13659},
+      {x:0.719, y:0.08965},{x:0.863, y:0.06452},{x:1.0,   y:0.04067},{x:1.144, y:0.02865},
+      {x:1.288, y:0.01943},{x:1.432, y:0.01333},{x:1.576, y:0.01072},{x:1.719, y:0.00580},
+      {x:1.863, y:0.00597},{x:2.0,   y:0.00382},{x:2.144, y:0.00311},{x:2.288, y:0.00403},
+      {x:2.432, y:0.00414},{x:2.576, y:0.00252},{x:2.719, y:0.00313},{x:2.863, y:0.00320},
+      {x:3.0,   y:0.00276}
+    ],
+    color: '#8b5cf6', bg: 'rgba(139,92,246,0.08)', dash: []
+  },
+  {
+    label: '4. M3 ThinkAll (4ep)',
+    data: [
+      {x:0.108, y:0.61017},{x:0.215, y:0.52427},{x:0.323, y:0.46688},{x:0.430, y:0.44178},
+      {x:0.538, y:0.39061},{x:0.645, y:0.32151},{x:0.753, y:0.24660},{x:0.860, y:0.17226},
+      {x:0.968, y:0.10819},{x:1.075, y:0.07545},{x:1.183, y:0.05306},{x:1.290, y:0.03919},
+      {x:1.398, y:0.02217},{x:1.505, y:0.01812},{x:1.613, y:0.01323},{x:1.720, y:0.01068},
+      {x:1.828, y:0.00804},{x:1.935, y:0.00628},{x:2.043, y:0.00415},{x:2.151, y:0.00419},
+      {x:2.258, y:0.00171},{x:2.366, y:0.00259},{x:2.473, y:0.00223},{x:2.581, y:0.00192},
+      {x:2.688, y:0.00255},{x:2.796, y:0.00226},{x:2.903, y:0.00129},{x:3.011, y:0.00182},
+      {x:3.118, y:0.00113},{x:3.226, y:0.00111},{x:3.333, y:0.00146},{x:3.441, y:0.00153},
+      {x:3.548, y:0.00102},{x:3.656, y:0.00183},{x:3.763, y:0.00144},{x:3.871, y:0.00118},
+      {x:3.978, y:0.00074}
+    ],
+    color: '#14b8a6', bg: 'rgba(20,184,166,0.08)', dash: []
+  },
+  {
+    label: '5. GLM-5.2 (3ep, 4GPU重训)',
+    data: [
+      {x:0.1544, y:0.64778},{x:0.3089, y:0.51585},{x:0.4633, y:0.40872},{x:0.6178, y:0.30961},
+      {x:0.7722, y:0.22836},{x:0.9266, y:0.14868},{x:1.0772, y:0.09557},{x:1.2317, y:0.06193},
+      {x:1.3861, y:0.04473},{x:1.5405, y:0.02713},{x:1.6950, y:0.01927},{x:1.8494, y:0.01619},
+      {x:2.0000, y:0.01686},{x:2.1544, y:0.01042},{x:2.3089, y:0.00715},{x:2.4633, y:0.00675},
+      {x:2.6178, y:0.00600},{x:2.7722, y:0.00815},{x:2.9266, y:0.00557}
+    ],
+    color: '#ec4899', bg: 'rgba(236,72,153,0.08)', dash: []
+  }
+];
+
+const top3 = [datasets[2], datasets[3], datasets[4]]; // 27B ThinkAll, M3 ThinkAll, GLM-5.2
+
+// ===== CHART OPTIONS =====
+function makeOptions(isLog, isPerEpoch) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 400 },
+    interaction: { mode: 'nearest', intersect: false },
+    plugins: {
+      legend: {
+        position: 'bottom',
+        labels: { usePointStyle: true, padding: 20, font: { size: 12 }, boxWidth: 10 }
+      },
+      tooltip: {
+        callbacks: {
+          label: ctx => ` ${ctx.dataset.label}: loss = ${ctx.parsed.y.toFixed(5)}`
+        }
+      }
+    },
+    scales: {
+      x: {
+        title: { display: true, text: isPerEpoch ? 'Epoch (归一化)' : 'Epoch', font: { size: 12 } },
+        grid: { color: '#f1f5f9' }
+      },
+      y: {
+        type: isLog ? 'logarithmic' : 'linear',
+        title: { display: true, text: isLog ? 'Loss (log scale)' : 'Loss', font: { size: 12 } },
+        min: isLog ? 0.0005 : 0,
+        grid: { color: '#f1f5f9' }
+      }
+    }
+  };
+}
+
+// ===== CREATE CHARTS =====
+const ctxAll = document.getElementById('lossAll').getContext('2d');
+new Chart(ctxAll, {
+  type: 'scatter',
+  data: {
+    datasets: datasets.map(d => ({
+      label: d.label,
+      data: d.data,
+      borderColor: d.color,
+      backgroundColor: d.color,
+      borderWidth: 1.8,
+      pointRadius: 1.5,
+      pointHoverRadius: 5,
+      showLine: true,
+      tension: 0.15,
+      borderDash: d.dash,
+    }))
+  },
+  options: makeOptions(false, false)
+});
+
+const ctxBest = document.getElementById('lossBest').getContext('2d');
+new Chart(ctxBest, {
+  type: 'scatter',
+  data: {
+    datasets: top3.map(d => ({
+      label: d.label,
+      data: d.data,
+      borderColor: d.color,
+      backgroundColor: d.color,
+      borderWidth: 2,
+      pointRadius: 2,
+      pointHoverRadius: 5,
+      showLine: true,
+      tension: 0.15,
+    }))
+  },
+  options: Object.assign({}, makeOptions(false, false), {
+    scales: {
+      x: { title: { display: true, text: 'Epoch' }, grid: { color: '#f1f5f9' } },
+      y: { title: { display: true, text: 'Loss' }, min: 0, max: 0.08, grid: { color: '#f1f5f9' } }
+    }
+  })
+});
+
+const ctxLog = document.getElementById('lossLog').getContext('2d');
+new Chart(ctxLog, {
+  type: 'scatter',
+  data: {
+    datasets: datasets.map(d => ({
+      label: d.label,
+      data: d.data,
+      borderColor: d.color,
+      backgroundColor: d.color,
+      borderWidth: 1.8,
+      pointRadius: 1.5,
+      pointHoverRadius: 5,
+      showLine: true,
+      tension: 0.15,
+      borderDash: d.dash,
+    }))
+  },
+  options: makeOptions(true, false)
+});
+
+// Per-epoch aligned (normalize epoch to integer steps)
+const ctxEpoch = document.getElementById('lossPerEpoch').getContext('2d');
+new Chart(ctxEpoch, {
+  type: 'scatter',
+  data: {
+    datasets: datasets.map(d => ({
+      label: d.label,
+      data: d.data,
+      borderColor: d.color,
+      backgroundColor: d.color,
+      borderWidth: 1.8,
+      pointRadius: 1.5,
+      pointHoverRadius: 5,
+      showLine: true,
+      tension: 0.15,
+      borderDash: d.dash,
+    }))
+  },
+  options: makeOptions(false, true)
+});
+
+// ===== TAB SWITCHING =====
+function switchChart(name) {
+  document.querySelectorAll('#chart-tabs .tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('chart-all').style.display = 'none';
+  document.getElementById('chart-best').style.display = 'none';
+  document.getElementById('chart-log').style.display = 'none';
+  document.getElementById('chart-perepoch').style.display = 'none';
+
+  if (name === 'all') {
+    document.getElementById('chart-all').style.display = 'block';
+    document.querySelector('#chart-tabs .tab:nth-child(1)').classList.add('active');
+  } else if (name === 'best') {
+    document.getElementById('chart-best').style.display = 'block';
+    document.querySelector('#chart-tabs .tab:nth-child(2)').classList.add('active');
+  } else if (name === 'log') {
+    document.getElementById('chart-log').style.display = 'block';
+    document.querySelector('#chart-tabs .tab:nth-child(3)').classList.add('active');
+  } else if (name === 'perepoch') {
+    document.getElementById('chart-perepoch').style.display = 'block';
+    document.querySelector('#chart-tabs .tab:nth-child(4)').classList.add('active');
+  }
+}
+
+// ===== DATES =====
+const now = new Date();
+document.getElementById('gen-time').textContent = now.toISOString().slice(0, 19).replace('T', ' ');
+document.getElementById('footer-date').textContent = now.toISOString().slice(0, 19).replace('T', ' ');
+</script>
+</body>
+</html>

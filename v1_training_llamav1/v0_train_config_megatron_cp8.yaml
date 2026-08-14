@@ -1,0 +1,68 @@
+# =============================================================================
+# V1 数据处理 + V0 训练 + Megatron 后端 + CP=8
+# =============================================================================
+# 使用方式:
+#   1. 先运行 v1_tokenize_dataset.py 生成 tokenized_dataset/
+#   2. 用此配置训练: llamafactory-cli train v0_train_config_megatron_cp8.yaml
+#      (入口会自动路由到 MCA Megatron 后端)
+#
+# 并行策略:
+#   CP=8  — 8 张 GPU 做 context parallelism（长序列拆分到 8 卡）
+#   DP=1  — 无数据并行（全局 batch size 不变）
+#   TP=1  — 无张量并行
+#   PP=1  — 无流水线并行
+#   总计需 8 张 GPU
+# =============================================================================
+
+### model
+model_name_or_path: Qwen/Qwen3.5-2B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full          # MCA 目前仅支持 full 微调
+use_mca: true                  # 启用 Megatron-Core Accelerate 后端
+
+### dataset — V1 预 token 化数据
+tokenized_path: ./tokenized_dataset
+dataset: null
+template: qwen3_5
+cutoff_len: 32768
+preprocessing_num_workers: 16
+
+### output
+output_dir: ./saves/qwen3.5-2b-v1-megatron-cp8
+logging_steps: 1
+save_strategy: epoch
+save_total_limit: 5
+plot_loss: true
+overwrite_output_dir: true
+report_to: swanlab
+
+### training
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 1.0e-4
+num_train_epochs: 3
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+weight_decay: 0.01
+bf16: true
+ddp_timeout: 180000000
+max_grad_norm: 1.0
+flash_attn: flash_attention_2
+gradient_checkpointing: true
+recompute_granularity: full
+
+### Megatron 并行配置 (CP=8, DP=1, TP=1, PP=1)
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+context_parallel_size: 8
+sequence_parallel: false
+expert_model_parallel_size: 1
+use_distributed_optimizer: true
+overlap_param_gather: true
+overlap_grad_reduce: true
+bias_activation_fusion: true
+apply_rope_fusion: true
