@@ -233,7 +233,7 @@ def _turn_segments(messages: list[dict]) -> list[list[dict]]:
     return segments
 
 
-def build_sample(tokenizer, messages: list[dict], loss_norm: str, supervise: str = "all") -> dict:
+def build_sample(tokenizer, messages: list[dict], loss_norm: str, supervise: str = "last") -> dict:
     """一条完整多轮对话 → {input_ids, attention_mask, position_ids, loss_mask,
     turn_lengths, turn_offsets}。
 
@@ -313,9 +313,9 @@ def main():
     parser.add_argument("--max-samples", type=int, default=-1, help="限制样本数 (-1 = 全部)")
     parser.add_argument("--no-filter", dest="no_filter", action="store_true", default=False,
                         help="不过滤（保持原行为）；默认过滤多模态及无 assistant 结尾的数据")
-    parser.add_argument("--supervise", dest="supervise", default="all",
+    parser.add_argument("--supervise", dest="supervise", default="last",
                         choices=["all", "last"],
-                        help="all=所有assistant turn都监督 (默认), last=只监督最后一个assistant turn")
+                        help="last=只监督最后一个assistant turn (默认), all=所有assistant turn都监督")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):

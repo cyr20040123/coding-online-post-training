@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
-Step 1: 拆分形式的多轮对话 → 合并为完整多轮对话
+Step 1: 多轮对话清洗（去重 + 可选的前缀合并）
 
-将前缀拆分形式的数据（同源对话被切成 "messages[:cut]" 前缀链）合并回完整对话。
+默认行为（不传 --merge）:
+- 完全重复的对话去重（保留先出现的一条）
+- 其余数据原样通过
+
+开启 --merge 时额外:
 - 前缀链检测: 若样本 A 的 messages 是样本 B 的 messages 的严格前缀，则 A 被 B 吸收
-- 合并规则: 每组前缀链只保留最长样本 = 完整对话
-- 幂等: 无前缀关系的数据（如 data_openai 已是完整对话）原样通过
+  （用于将 "messages[:cut]" 前缀拆分形式的数据合并回完整对话）
+- 每组前缀链只保留最长样本 = 完整对话
 
 输入: data_openai 目录（每个 JSON 文件是一个 item 列表，OpenAI 格式）
-输出: 一行一条完整多轮对话的 JSONL（含 conversation_id，可检视）
+输出: 一行一条对话的 JSONL（含 conversation_id，可检视）
 
 用法:
+    # 仅去重（默认）
     python merge_split_to_multiturn.py \
         --input /path/to/data_openai \
         --output ./data/multiturn_merged.jsonl
+
+    # 去重 + 前缀合并
+    python merge_split_to_multiturn.py \
+        --input /path/to/data_openai \
+        --output ./data/multiturn_merged.jsonl \
+        --merge
 """
 
 import argparse
@@ -91,6 +102,8 @@ def main():
     parser = argparse.ArgumentParser(description="Merge prefix-split multi-turn conversations")
     parser.add_argument("--input", "-i", required=True, help="data_openai 目录或单个 JSON 文件")
     parser.add_argument("--output", "-o", required=True, help="输出 JSONL 路径")
+    parser.add_argument("--merge", action="store_true", default=False,
+                        help="开启前缀匹配合并（默认关闭，仅做完全重复去重）")
     args = parser.parse_args()
 
     items = load_items(args.input)
@@ -105,6 +118,8 @@ def main():
 
     absorbed: set[int] = set()   # 被吸收的前缀样本索引
     duplicate_of: dict[int, int] = {}
+    n_duplicates = 0
+    n_prefix_merged = 0
 
     for sig, members in groups.items():
         members_sorted = sorted(members, key=lambda i: len(items[i][1]["messages"]))
@@ -122,8 +137,10 @@ def main():
                         # 完全重复的对话，保留先出现的
                         duplicate_of[j] = i
                         absorbed.add(j)
-                elif _is_prefix(msgs_i, msgs_j):
+                        n_duplicates += 1
+                elif args.merge and _is_prefix(msgs_i, msgs_j):
                     absorbed.add(i)
+                    n_prefix_merged += 1
                     break  # i 已确认被吸收，无需继续
 
     # 输出未被吸收的（最长）样本
@@ -140,7 +157,8 @@ def main():
             written += 1
 
     print(f"[Merge] {len(items)} items → {written} complete conversations")
-    print(f"        absorbed (prefix/duplicate): {len(absorbed)}")
+    print(f"        duplicates removed: {n_duplicates}")
+    print(f"        prefix-merged:      {n_prefix_merged} (merge={'on' if args.merge else 'off'})")
     print(f"[Save] → {args.output}")
 
 
