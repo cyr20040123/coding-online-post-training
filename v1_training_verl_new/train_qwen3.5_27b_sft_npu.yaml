@@ -1,0 +1,127 @@
+# =============================================================================
+# verl SFT: Qwen3.5-2B + LoRA + 48K 上下文
+# 并行: FSDP1 + Ulysses SP=8（DP=1），8 卡全做序列并行，每卡 6K tokens
+# 数据: sft_train_llama_align.parquet（token 归一化 + 只训最后一轮，对齐 llama）
+# 超长: 不切窗（window_length=0），框架 token 级 left 截断兜底
+# 说明: FSDP2+offload 在 verl 0.8.0 有 clip_grad_norm CPU bug，故用 FSDP1
+# =============================================================================
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - model@model: hf_model
+  - engine@engine: fsdp
+  - optim@optim: fsdp
+  - profiler@profiler: profiler
+  - _self_
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _target_: verl.workers.config.HFModelConfig
+  path: Qwen/Qwen3.5-27B
+  tokenizer_path: Qwen/Qwen3.5-27B
+  trust_remote_code: true
+  enable_gradient_checkpointing: true
+  use_remove_padding: true
+  use_liger: false
+
+  override_config:
+    attn_implementation: flash_attention_2
+
+  lora_rank: 16
+  lora_alpha: 16
+  target_modules: all-linear
+
+# ── Engine (FSDP1 + Ulysses SP=8，冒烟验证通过) ───────────────────────────────
+# 注意: FSDP2 + offload 在 verl 0.8.0 有 clip_grad_norm CPU bug；
+#       48K 用 SP=8 每卡仅 6K tokens，无需 offload，显存峰值 16GB
+engine:
+  _target_: verl.workers.config.FSDPEngineConfig
+  strategy: fsdp
+  seed: 42
+  dtype: bfloat16
+  use_torch_compile: false
+  reshard_after_forward: true
+  param_offload: false
+  optimizer_offload: false
+  offload_policy: false
+  fsdp_size: -1
+  ulysses_sequence_parallel_size: 8
+
+# ── Optimizer ────────────────────────────────────────────────────────────────
+optim:
+  _target_: verl.workers.config.FSDPOptimizerConfig
+  optimizer: AdamW
+  optimizer_impl: torch.optim
+  lr: 5.0e-5
+  weight_decay: 0.01
+  clip_grad: 1.0
+  lr_scheduler_type: cosine
+  lr_warmup_steps_ratio: 0.1
+  min_lr_ratio: 0.0
+  num_cycles: 0.5
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+data:
+  train_batch_size: 2
+  micro_batch_size_per_gpu: 1
+  max_token_len_per_gpu: 6144
+  use_dynamic_bsz: True
+  train_files: data/sft_train_sqrt_last.parquet
+  val_files: null
+  train_max_samples: -1
+  val_max_samples: -1
+
+  messages_key: messages
+  loss_mask_key: loss_mask
+  turn_offsets_key: turn_offsets
+  pad_mode: no_padding
+  max_length: 49152
+  truncation: left            # 安全网：单轮本身超长时的兜底截断
+  use_shm: False
+  apply_chat_template_kwargs: {}
+  num_workers: 4
+
+  # 关闭滑动窗口：每条对话 1 条样本原样交给 verl，
+  # 超长由框架 token 级截断处理（truncation: left 保留尾部较新 token）
+  window_length: 0
+  window_overlap_turns: 2
+
+  custom_cls:
+    path: qwen_multiturn_sft_dataset.py
+    name: QwenMultiTurnSFTDataset
+
+# ── Checkpoint ───────────────────────────────────────────────────────────────
+checkpoint:
+  _target_: verl.trainer.config.CheckpointConfig
+  save_contents: ["model", "optimizer", "extra"]
+  load_contents: ${checkpoint.save_contents}
+  mbridge_config: {}
+
+# ── Trainer ──────────────────────────────────────────────────────────────────
+trainer:
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_hdfs_dir: null
+  project_name: jiuwen-sft-verl-new
+  experiment_name: qwen3.5-2b-lora64-sp8-48k-sqrt-last
+  total_epochs: 4
+  total_training_steps: null
+  logger: ['console']
+  seed: 42
+  save_freq: after_each_epoch
+  test_freq: -1
+  max_ckpt_to_keep: 5
+  balance_batch: True
+  resume_mode: auto
+  resume_from_path: null
+  device: npu
+  nnodes: 1
+  n_gpus_per_node: 8
+  profile_interval: [-1, -1]
+
+# ── Profiler ─────────────────────────────────────────────────────────────────
+profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  enable: False
