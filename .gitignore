@@ -31,3 +31,5 @@ traj_comparison
 trajectories_0720
 v1_training
 v0_llama_miniswe_train
+*.7z
+*.zip
