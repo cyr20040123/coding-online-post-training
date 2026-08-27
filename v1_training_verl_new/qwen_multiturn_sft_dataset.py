@@ -143,21 +143,25 @@ class QwenMultiTurnSFTDataset(Dataset):
           序列 <= window_length → 1 个条目
           序列 > window_length  → 按轮边界拆窗，保留 window_overlap_turns 轮重叠，
           保证每一轮至少被训练一次（头轮不丢失）
-        条目格式: (row_idx, start_token, end_token)
+        条目格式: (row_idx, start_token, end_token, sup_start_token)
+
+        sup_start_token: 本窗口内监督起点。与上一窗口重叠的轮次只作上下文
+        （loss_mask 置 0，不重复计 loss），监督仅落在上一窗口未覆盖的新轮上，
+        保证每轮每个 epoch 严格训练一次。
         """
-        self.window_index: list[tuple[int, int, int]] = []
+        self.window_index: list[tuple[int, int, int, int]] = []
         n_windowed = 0
         n_overlong = 0
         for row_idx in range(len(self.dataframe)):
             seq_len = len(self.dataframe.iloc[row_idx]["input_ids"])
             if not self.sliding_window:
                 # 不拆窗：完整对话原样给 verl（框架侧 token 截断）
-                self.window_index.append((row_idx, 0, seq_len))
+                self.window_index.append((row_idx, 0, seq_len, 0))
                 continue
 
             win_len = int(self.window_length)
             if seq_len <= win_len:
-                self.window_index.append((row_idx, 0, seq_len))
+                self.window_index.append((row_idx, 0, seq_len, 0))
                 continue
 
             n_overlong += 1
@@ -167,12 +171,13 @@ class QwenMultiTurnSFTDataset(Dataset):
 
             if not offsets:
                 # 无轮边界信息：整条给运行时 truncation
-                self.window_index.append((row_idx, 0, seq_len))
+                self.window_index.append((row_idx, 0, seq_len, 0))
                 continue
 
             n_windowed += 1
             n_segs = len(offsets)
             cur_start = 0
+            prev_end = -1  # 上一窗口已覆盖（且已监督）的最后一段
             while cur_start < n_segs:
                 # 找从 cur_start 出发能放下的最大 end（至少含 cur_start 本身）
                 end = cur_start
@@ -181,14 +186,21 @@ class QwenMultiTurnSFTDataset(Dataset):
                         end = e
                     else:
                         break
-                self.window_index.append((row_idx, offsets[cur_start][0], offsets[end][1]))
+                # 与上一窗口重叠的段只作上下文：监督从上一窗口结束后的第一个新段开始
+                # （无重叠时 sup_start_seg == cur_start，即全窗监督）
+                sup_start_seg = max(cur_start, prev_end + 1)
+                sup_start = offsets[sup_start_seg][0]
+                self.window_index.append(
+                    (row_idx, offsets[cur_start][0], offsets[end][1], sup_start)
+                )
+                prev_end = end
                 if end >= n_segs - 1:
                     break
                 cur_start = max(cur_start + 1, end + 1 - self.window_overlap_turns)
 
         print(f"QwenMultiTurnSFTDataset: {len(self.window_index)} window entries "
               f"({n_overlong} overlong rows, {n_windowed} windowed, "
-              f"window_length={self.window_length})")
+              f"window_length={self.window_length}, overlap-as-context mask on)")
 
     def __len__(self):
         if self.pre_tokenized:
@@ -201,11 +213,15 @@ class QwenMultiTurnSFTDataset(Dataset):
 
     def _get_pre_tokenized(self, item: int) -> dict:
         """读取 Step 2 产出的预 token 化行，应用滑动窗口 + truncation/padding。"""
-        row_idx, start_token, end_token = self.window_index[item]
+        row_idx, start_token, end_token, sup_start = self.window_index[item]
         row = self.dataframe.iloc[row_idx]
         input_ids = torch.tensor(list(row["input_ids"])[start_token:end_token], dtype=torch.long)
         attention_mask = torch.tensor(list(row["attention_mask"])[start_token:end_token], dtype=torch.long)
         loss_mask = torch.tensor(list(row[self.loss_mask_key])[start_token:end_token], dtype=torch.float32)
+        # 与上一窗口重叠的部分只作上下文：监督区从 sup_start 开始，头部 loss 置 0
+        sup_offset = max(0, sup_start - start_token)
+        if sup_offset > 0:
+            loss_mask[:sup_offset] = 0.0
         # 窗口内 position 从 0 重新编号
         position_ids = torch.arange(end_token - start_token, dtype=torch.long)
 

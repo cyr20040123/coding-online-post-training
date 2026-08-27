@@ -1,0 +1,154 @@
+# =============================================================================
+# verl SFT: Qwen3.5-2B + LoRA + 48K —— 方法1（merge + supervise all）配置
+# 并行: FSDP1 + Ulysses SP=8（DP=1），8 卡全做序列并行，每卡 6K tokens
+#
+# 数据链路（方法1）:
+#   Step1: python merge_split_to_multiturn.py \
+#              --input <data_openai_dir> \
+#              --output data/multiturn_m3mini50_merged.jsonl \
+#              --merge / --relax            # relax 用于合并含有 system-reminder 导致前缀无法严格匹配的数据
+#   Step2: python multiturn_to_verl_norm.py \
+#              --input data/multiturn_m3mini50_merged.jsonl \
+#              --output data/data_m3mini50_merged.parquet \
+#              --model Qwen/Qwen3.5-2B \
+#              --loss-norm token \
+#              --supervise all              # 所有 assistant 轮都监督（verl 语义）
+#   注: train_files 指向的 parquet 需先按上述命令生成；--supervise/--loss-norm
+#       在 Step2 烘焙进 loss_mask，本配置只负责正确读取。
+#
+# 相比 train_qwen3.5_2b_sft_48k.yaml 的关键变化:
+#   1. 数据换成 merge 后的完整对话（每条轨迹一行，全部轮次监督）
+#   2. 开启滑动窗口 window_length=49152：超长对话按轮边界拆窗（头轮不丢失、
+#      末轮必保留），替代旧配置 window_length=0 时 truncation=left 对早期
+#      轮次监督信号的静默丢弃
+#   3. steps_per_epoch 会因拆窗自动增加，cosine/warmup 按
+#      total_training_steps 自适应，无需手动改学习率时间表
+#
+# 本配置无法修复、保留原状的问题（已知悉）:
+#   a. 滑动窗口重叠 window_overlap_turns=2：交界轮次会作为后窗的上下文重复
+#      前向，但 loss_mask 已在数据集侧置 0（overlap-as-context），每轮每个
+#      epoch 仍严格只被监督一次；代价仅是少量额外计算
+#   b. Step2 默认过滤掉不以 assistant 结尾的对话（no_asst），该行为在脚本侧，
+#      yaml 无法干预；两条处理链路受影响方式一致
+#   c. 与方法2（nomerge + supervise last）不存在 bit 级等价：batch 组成、
+#      optimizer 步数、shuffle 空间均不同，只能做到分布意义上的近似对齐
+#   d. 单条 assistant 轮本身超过 window_length 时仍走 truncation=left 兜底
+# =============================================================================
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - model@model: hf_model
+  - engine@engine: fsdp
+  - optim@optim: fsdp
+  - profiler@profiler: profiler
+  - _self_
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _target_: verl.workers.config.HFModelConfig
+  path: Qwen/Qwen3.5-2B
+  tokenizer_path: Qwen/Qwen3.5-2B
+  trust_remote_code: true
+  enable_gradient_checkpointing: true
+  use_remove_padding: true
+  use_liger: true
+
+  override_config:
+    attn_implementation: flash_attention_2
+
+  lora_rank: 64
+  lora_alpha: 64
+  target_modules: all-linear
+
+# ── Engine (FSDP1 + Ulysses SP=8) ────────────────────────────────────────────
+engine:
+  _target_: verl.workers.config.FSDPEngineConfig
+  strategy: fsdp
+  seed: 42
+  dtype: bfloat16
+  use_torch_compile: false
+  reshard_after_forward: true
+  param_offload: false
+  optimizer_offload: false
+  offload_policy: false
+  fsdp_size: -1
+  ulysses_sequence_parallel_size: 8
+
+# ── Optimizer ────────────────────────────────────────────────────────────────
+optim:
+  _target_: verl.workers.config.FSDPOptimizerConfig
+  optimizer: AdamW
+  optimizer_impl: torch.optim
+  lr: 1.0e-4
+  weight_decay: 0.01
+  clip_grad: 1.0
+  lr_scheduler_type: cosine
+  lr_warmup_steps_ratio: 0.1
+  min_lr_ratio: 0.0
+  num_cycles: 0.5
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+data:
+  train_batch_size: 2            # 每 step 2 条完整对话（全轮监督，信号量远大于 last 模式）
+  micro_batch_size_per_gpu: 1
+  max_token_len_per_gpu: 6144    # × SP=8 = 49152，恰好容纳一个最大窗口
+  use_dynamic_bsz: True
+  train_files: data/data_m3mini50_merged.parquet   # 需先按文件头命令生成（merge + supervise all）
+  val_files: null
+  train_max_samples: -1
+  val_max_samples: -1
+
+  messages_key: messages
+  loss_mask_key: loss_mask
+  turn_offsets_key: turn_offsets
+  pad_mode: no_padding
+  max_length: 49152              # 与窗口上限一致；正常情况下窗口不会触发截断
+  truncation: left               # 仅兜底：单个轮次本身超长时才会触发
+  use_shm: False
+  apply_chat_template_kwargs: {}
+  num_workers: 4
+
+  # 开启滑动窗口：>49K 的对话按 turn_offsets 轮边界拆窗，
+  # 每窗 ≤ window_length，重叠 window_overlap_turns 轮，头轮不丢失
+  window_length: 49152           # 0 = 关闭（旧行为，left 截断丢早期轮）；此处必须 >0
+  window_overlap_turns: 4        # 0 可让每轮每 epoch 严格只被监督一次，但窗口头部的assistant轮严重缺失上文
+
+  custom_cls:
+    path: qwen_multiturn_sft_dataset.py
+    name: QwenMultiTurnSFTDataset
+
+# ── Checkpoint ───────────────────────────────────────────────────────────────
+checkpoint:
+  _target_: verl.trainer.config.CheckpointConfig
+  save_contents: ["model", "optimizer", "extra"]
+  load_contents: ${checkpoint.save_contents}
+  mbridge_config: {}
+
+# ── Trainer ──────────────────────────────────────────────────────────────────
+trainer:
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_hdfs_dir: null
+  project_name: jiuwen-sft-verl-new
+  experiment_name: 2blora-m3-oracle-merge-think-token-all
+  total_epochs: 6
+  total_training_steps: null
+  logger: ['console']
+  seed: 42
+  save_freq: after_each_epoch
+  test_freq: -1
+  max_ckpt_to_keep: 5
+  balance_batch: True
+  resume_mode: auto
+  resume_from_path: null
+  device: cuda
+  nnodes: 1
+  n_gpus_per_node: 8
+  profile_interval: [-1, -1]
+
+# ── Profiler ─────────────────────────────────────────────────────────────────
+profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  enable: False

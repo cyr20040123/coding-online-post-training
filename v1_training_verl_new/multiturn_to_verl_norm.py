@@ -18,6 +18,9 @@ loss-norm 模式:
   sqrt  — 每 token 权重 1/sqrt(len)      （每轮总权重 = sqrt(len)）
   turn  — 每 token 权重 1/len            （每轮总权重 = 1）
 
+多线程: --workers N 并行 tokenize（默认 min(32, CPU核数), 1=单线程）。
+        ex.map 保序，结果与单线程逐条处理一致。
+
 用法:
     python multiturn_to_verl_norm.py \
         --input ./data/multiturn_merged.jsonl \
@@ -32,10 +35,12 @@ import logging
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import torch
 from transformers import AutoTokenizer
+from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -302,6 +307,38 @@ def _ends_with_assistant(raw_messages: list) -> bool:
     return bool(raw_messages) and raw_messages[-1].get("role") == "assistant"
 
 
+def process_one(conv: dict, tokenizer, loss_norm: str, supervise: str, no_filter: bool):
+    """处理单条对话（线程池 worker 入口，无共享状态）。
+
+    返回 ("kept", row_dict, n_tokens) 或 ("mm",) / ("no_asst",) / ("skip",)。
+    """
+    raw_messages = conv.get("messages")
+    if not isinstance(raw_messages, list) or not raw_messages:
+        return ("skip",)
+
+    # ── 过滤（默认开启，--no-filter 关闭）──
+    if not no_filter:
+        if _is_multimodal(raw_messages):
+            return ("mm",)
+        if not _ends_with_assistant(raw_messages):
+            return ("no_asst",)
+
+    # OpenAI → Qwen 文本格式（system 保留，agent 数据依赖 system prompt）
+    converted = [convert_message_openai(m) for m in raw_messages]
+
+    sample = build_sample(tokenizer, converted, loss_norm, supervise)
+    row = {
+        "messages": converted,
+        "input_ids": sample["input_ids"],
+        "attention_mask": sample["attention_mask"],
+        "position_ids": sample["position_ids"],
+        "loss_mask": sample["loss_mask"],
+        "turn_lengths": sample["turn_lengths"],
+        "turn_offsets": sample["turn_offsets"],
+    }
+    return ("kept", row, len(sample["input_ids"]))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-turn conversations → loss-norm VeRL Parquet")
     parser.add_argument("--input", "-i", required=True, help="Step 1 产出的合并 JSONL")
@@ -316,6 +353,8 @@ def main():
     parser.add_argument("--supervise", dest="supervise", default="last",
                         choices=["all", "last"],
                         help="last=只监督最后一个assistant turn (默认), all=所有assistant turn都监督")
+    parser.add_argument("--workers", type=int, default=min(32, (os.cpu_count() or 4)),
+                        help="tokenize 并行线程数 (默认 min(32, CPU核数), 1=单线程)")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -323,6 +362,9 @@ def main():
         sys.exit(1)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    # 预热模板编译缓存，避免多线程首次调用时并发编译
+    tokenizer.apply_chat_template([{"role": "user", "content": [{"type": "text", "text": ""}]}],
+                                  add_generation_prompt=False, tokenize=False)
 
     # 读取合并 JSONL
     conversations = []
@@ -341,40 +383,34 @@ def main():
     logger.info("Loaded %d conversations (filter=%s)", len(conversations),
                 "off" if args.no_filter else "on")
 
+    pbar = tqdm(total=len(conversations), desc="tokenize", unit="conv",
+                postfix={"kept": 0, "no_asst": 0, "mm": 0, "skip": 0})
     rows = []
     skipped = 0
     filtered_multimodal = 0
     filtered_no_assistant = 0
     total_tokens = 0
-    for conv in conversations:
-        raw_messages = conv.get("messages")
-        if not isinstance(raw_messages, list) or not raw_messages:
-            skipped += 1
-            continue
 
-        # ── 过滤（默认开启，--no-filter 关闭）──
-        if not args.no_filter:
-            if _is_multimodal(raw_messages):
+    def _process(conv):
+        return process_one(conv, tokenizer, args.loss_norm, args.supervise, args.no_filter)
+
+    # 多线程 tokenize：ex.map 保序，结果与单线程逐条处理一致
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        for res in ex.map(_process, conversations):
+            kind = res[0]
+            if kind == "kept":
+                rows.append(res[1])
+                total_tokens += res[2]
+            elif kind == "mm":
                 filtered_multimodal += 1
-                continue
-            if not _ends_with_assistant(raw_messages):
+            elif kind == "no_asst":
                 filtered_no_assistant += 1
-                continue
-
-        # OpenAI → Qwen 文本格式（system 保留，agent 数据依赖 system prompt）
-        converted = [convert_message_openai(m) for m in raw_messages]
-
-        sample = build_sample(tokenizer, converted, args.loss_norm, args.supervise)
-        rows.append({
-            "messages": converted,
-            "input_ids": sample["input_ids"],
-            "attention_mask": sample["attention_mask"],
-            "position_ids": sample["position_ids"],
-            "loss_mask": sample["loss_mask"],
-            "turn_lengths": sample["turn_lengths"],
-            "turn_offsets": sample["turn_offsets"],
-        })
-        total_tokens += len(sample["input_ids"])
+            else:
+                skipped += 1
+            pbar.update(1)
+            pbar.set_postfix({"kept": len(rows), "no_asst": filtered_no_assistant,
+                              "mm": filtered_multimodal, "skip": skipped})
+    pbar.close()
 
     df = pd.DataFrame(rows)
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
@@ -382,7 +418,7 @@ def main():
 
     size_mb = os.path.getsize(args.output) / (1024 * 1024)
     logger.info("Saved Parquet: %s (%.1f MB, %d rows)", args.output, size_mb, len(df))
-    logger.info("Loss norm mode: %s, supervise: %s", args.loss_norm, args.supervise)
+    logger.info("Loss norm mode: %s, supervise: %s, workers: %d", args.loss_norm, args.supervise, args.workers)
     logger.info("Total tokens: %d", total_tokens)
     logger.info("Filtered: multimodal=%d, no_assistant_end=%d, empty/invalid=%d",
                 filtered_multimodal, filtered_no_assistant, skipped)

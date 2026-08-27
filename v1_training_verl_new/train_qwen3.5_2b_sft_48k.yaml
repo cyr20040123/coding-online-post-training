@@ -1,7 +1,8 @@
 # =============================================================================
 # verl SFT: Qwen3.5-2B + LoRA + 48K 上下文
 # 并行: FSDP1 + Ulysses SP=8（DP=1），8 卡全做序列并行，每卡 6K tokens
-# 数据: sft_train_llama_align.parquet（token 归一化 + 只训最后一轮，对齐 llama）
+# 数据: data_m3mini50_nomerge.parquet（m3 teacher 轨迹 522 条，纯去重不合并，
+#       token 归一化 + supervise last；99.6% assistant 轮含 <think> 思考块）
 # 超长: 不切窗（window_length=0），框架 token 级 left 截断兜底
 # 说明: FSDP2+offload 在 verl 0.8.0 有 clip_grad_norm CPU bug，故用 FSDP1
 # =============================================================================
@@ -55,7 +56,7 @@ optim:
   _target_: verl.workers.config.FSDPOptimizerConfig
   optimizer: AdamW
   optimizer_impl: torch.optim
-  lr: 5.0e-5
+  lr: 1.0e-4
   weight_decay: 0.01
   clip_grad: 1.0
   lr_scheduler_type: cosine
@@ -69,7 +70,7 @@ data:
   micro_batch_size_per_gpu: 1
   max_token_len_per_gpu: 6144
   use_dynamic_bsz: True
-  train_files: data/sft_train_sqrt_last.parquet
+  train_files: data/data_m3mini50_nomerge.parquet
   val_files: null
   train_max_samples: -1
   val_max_samples: -1
@@ -105,8 +106,8 @@ trainer:
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   default_hdfs_dir: null
   project_name: jiuwen-sft-verl-new
-  experiment_name: qwen3.5-2b-lora64-sp8-48k-sqrt-last
-  total_epochs: 4
+  experiment_name: 2blora-m3-oracle-nomerge-think-token-last
+  total_epochs: 6
   total_training_steps: null
   logger: ['console']
   seed: 42
